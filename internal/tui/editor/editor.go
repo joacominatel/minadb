@@ -1,6 +1,7 @@
 package editor
 
 import (
+	"sort"
 	"strings"
 	"unicode"
 
@@ -35,6 +36,16 @@ var sqlKeywords = map[string]bool{
 	"true": true, "false": true, "ilike": true, "returning": true,
 }
 
+var sqlKeywordList = []string{
+	"SELECT", "FROM", "WHERE", "AND", "OR", "INSERT", "INTO", "UPDATE", "DELETE",
+	"CREATE", "DROP", "ALTER", "TABLE", "INDEX", "JOIN", "INNER", "OUTER", "LEFT",
+	"RIGHT", "CROSS", "ON", "NOT", "IN", "IS", "NULL", "LIKE", "ILIKE", "ORDER",
+	"BY", "GROUP", "HAVING", "LIMIT", "OFFSET", "AS", "DISTINCT", "COUNT", "SUM",
+	"AVG", "MIN", "MAX", "BETWEEN", "EXISTS", "CASE", "WHEN", "THEN", "ELSE", "END",
+	"VALUES", "SET", "BEGIN", "COMMIT", "ROLLBACK", "UNION", "ALL", "ASC", "DESC",
+	"PRIMARY", "KEY", "FOREIGN", "REFERENCES", "CASCADE", "RESTRICT", "DEFAULT", "RETURNING",
+}
+
 // Model is the SQL query editor component.
 type Model struct {
 	textarea textarea.Model
@@ -43,11 +54,11 @@ type Model struct {
 	focused  bool
 
 	// Completion state
-	tableNames  []string // cached table names from database
-	completing  bool     // in completion mode
-	completions []string // current candidates
-	compIndex   int      // which candidate is active
-	compPartial string   // the partial text that triggered completion
+	tableNames          []string // cached table names from database
+	showingCompletions  bool
+	completions         []string
+	completionIndex     int
+	completionStartByte int
 }
 
 // New creates a new editor model.
@@ -114,6 +125,11 @@ func (m *Model) Clear() {
 	m.cancelCompletion()
 }
 
+// CompletionActive reports if completion UI is open.
+func (m Model) CompletionActive() bool {
+	return m.showingCompletions
+}
+
 // Init returns the initial command.
 func (m Model) Init() tea.Cmd {
 	return textarea.Blink
@@ -145,33 +161,101 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 			return m, nil
 
 		case "ctrl+l":
-			// Format: uppercase SQL keywords
+			// Manual formatting is still useful for pasted queries.
 			m.formatKeywords()
 			return m, nil
 
-		case "tab":
-			// Try table name completion
-			if m.tryCompletion() {
+		case "ctrl+space":
+			m.openCompletions()
+			return m, nil
+
+		case "up":
+			if m.showingCompletions && len(m.completions) > 0 {
+				if m.completionIndex > 0 {
+					m.completionIndex--
+				}
 				return m, nil
 			}
-			// If no completions, fall through to textarea
+
+		case "down":
+			if m.showingCompletions && len(m.completions) > 0 {
+				if m.completionIndex < len(m.completions)-1 {
+					m.completionIndex++
+				}
+				return m, nil
+			}
+
+		case "enter", "tab":
+			if m.showingCompletions {
+				m.acceptCompletion()
+				return m, nil
+			}
 
 		case "esc":
-			if m.completing {
+			if m.showingCompletions {
 				m.cancelCompletion()
 				return m, nil
 			}
-		}
-
-		// Any key other than Tab/Esc cancels completion mode
-		if m.completing && key != "tab" && key != "esc" {
-			m.cancelCompletion()
 		}
 	}
 
 	var cmd tea.Cmd
 	m.textarea, cmd = m.textarea.Update(msg)
+
+	if keyMsg, ok := msg.(tea.KeyMsg); ok {
+		m.afterTextInput(keyMsg)
+	}
+
 	return m, cmd
+}
+
+func (m *Model) afterTextInput(msg tea.KeyMsg) {
+	key := msg.String()
+
+	if key == " " || key == "enter" || key == ";" {
+		m.autoUppercaseLastWord()
+	}
+
+	if m.showingCompletions {
+		m.refreshCompletions()
+	}
+}
+
+func (m *Model) autoUppercaseLastWord() {
+	val := m.textarea.Value()
+	runes := []rune(val)
+	if len(runes) < 2 {
+		return
+	}
+
+	i := len(runes) - 1
+	if !isWordBoundary(runes[i]) {
+		return
+	}
+	i--
+	for i >= 0 && isWordBoundary(runes[i]) {
+		i--
+	}
+	if i < 0 {
+		return
+	}
+
+	end := i
+	for i >= 0 && (unicode.IsLetter(runes[i]) || runes[i] == '_') {
+		i--
+	}
+	start := i + 1
+	if start > end {
+		return
+	}
+
+	word := string(runes[start : end+1])
+	if !sqlKeywords[strings.ToLower(word)] {
+		return
+	}
+
+	runes = append(runes[:start], append([]rune(strings.ToUpper(word)), runes[end+1:]...)...)
+	m.textarea.SetValue(string(runes))
 }
 
 // formatKeywords uppercases all SQL keywords in the editor content.
@@ -233,97 +317,142 @@ func (m *Model) flushWord(word *strings.Builder, result *strings.Builder) {
 
 // tryCompletion attempts table name completion at the current cursor position.
 // Returns true if a completion was applied.
-func (m *Model) tryCompletion() bool {
-	if len(m.tableNames) == 0 {
-		return false
+func (m *Model) openCompletions() {
+	prefix, start := extractTrailingIdentifier(m.textarea.Value())
+	suggestions := m.getSuggestions(prefix, start)
+	if len(suggestions) == 0 {
+		m.cancelCompletion()
+		return
 	}
 
-	val := m.textarea.Value()
-	if val == "" {
-		return false
-	}
-
-	// If already completing, cycle through candidates
-	if m.completing && len(m.completions) > 0 {
-		m.compIndex = (m.compIndex + 1) % len(m.completions)
-		m.applyCompletion()
-		return true
-	}
-
-	// Find the partial word at the end of the text
-	partial := extractLastWord(val)
-	if partial == "" {
-		return false
-	}
-
-	// Check if we're in a completion-worthy context (after FROM, JOIN, etc.)
-	upperVal := strings.ToUpper(val)
-	inTableContext := strings.Contains(upperVal, "FROM") ||
-		strings.Contains(upperVal, "JOIN") ||
-		strings.Contains(upperVal, "TABLE") ||
-		strings.Contains(upperVal, "INTO")
-
-	if !inTableContext {
-		return false
-	}
-
-	// Find matching table names
-	lower := strings.ToLower(partial)
-	var matches []string
-	for _, name := range m.tableNames {
-		if strings.HasPrefix(strings.ToLower(name), lower) {
-			matches = append(matches, name)
-		}
-	}
-
-	if len(matches) == 0 {
-		return false
-	}
-
-	m.completing = true
-	m.completions = matches
-	m.compIndex = 0
-	m.compPartial = partial
-	m.applyCompletion()
-	return true
+	m.showingCompletions = true
+	m.completions = suggestions
+	m.completionIndex = 0
+	m.completionStartByte = start
 }
 
-// applyCompletion replaces the partial word with the current completion candidate.
-func (m *Model) applyCompletion() {
-	if len(m.completions) == 0 {
+func (m *Model) refreshCompletions() {
+	if !m.showingCompletions {
+		return
+	}
+	prefix, start := extractTrailingIdentifier(m.textarea.Value())
+	suggestions := m.getSuggestions(prefix, start)
+	if len(suggestions) == 0 {
+		m.cancelCompletion()
+		return
+	}
+	m.completions = suggestions
+	m.completionStartByte = start
+	if m.completionIndex >= len(m.completions) {
+		m.completionIndex = len(m.completions) - 1
+	}
+}
+
+func (m *Model) acceptCompletion() {
+	if !m.showingCompletions || len(m.completions) == 0 {
 		return
 	}
 
 	val := m.textarea.Value()
-	// Remove the partial (or previous completion) from the end
-	base := strings.TrimSuffix(val, extractLastWord(val))
-	newVal := base + m.completions[m.compIndex]
+	if m.completionStartByte < 0 || m.completionStartByte > len(val) {
+		m.cancelCompletion()
+		return
+	}
+
+	newVal := val[:m.completionStartByte] + m.completions[m.completionIndex]
 	m.textarea.SetValue(newVal)
+	m.cancelCompletion()
 }
 
 func (m *Model) cancelCompletion() {
-	m.completing = false
+	m.showingCompletions = false
 	m.completions = nil
-	m.compIndex = 0
-	m.compPartial = ""
-}
-
-// extractLastWord returns the last word-like token from the text.
-func extractLastWord(s string) string {
-	s = strings.TrimRight(s, " \t\n\r")
-	if s == "" {
-		return ""
-	}
-	i := len(s) - 1
-	for i >= 0 && isIdentChar(rune(s[i])) {
-		i--
-	}
-	return s[i+1:]
+	m.completionIndex = 0
+	m.completionStartByte = 0
 }
 
 func isIdentChar(c rune) bool {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
 		(c >= '0' && c <= '9') || c == '_' || c == '.'
+}
+
+func isWordBoundary(c rune) bool {
+	return unicode.IsSpace(c) || c == ';' || c == ',' || c == ')' || c == '('
+}
+
+func extractTrailingIdentifier(s string) (string, int) {
+	if s == "" {
+		return "", 0
+	}
+
+	i := len(s)
+	for i > 0 {
+		r := rune(s[i-1])
+		if isIdentChar(r) {
+			i--
+			continue
+		}
+		break
+	}
+
+	return s[i:], i
+}
+
+func (m Model) getSuggestions(prefix string, start int) []string {
+	prefixLower := strings.ToLower(prefix)
+	prefixUpper := strings.ToUpper(prefix)
+
+	context := strings.TrimSpace(strings.ToUpper(m.textarea.Value()[:start]))
+	last := lastSQLToken(context)
+
+	candidates := make([]string, 0, len(sqlKeywordList)+len(m.tableNames)+1)
+
+	switch last {
+	case "FROM", "JOIN", "INTO", "UPDATE", "TABLE":
+		candidates = append(candidates, m.tableNames...)
+	case "SELECT":
+		candidates = append(candidates, "*")
+		candidates = append(candidates, sqlKeywordList...)
+		candidates = append(candidates, m.tableNames...)
+	default:
+		candidates = append(candidates, sqlKeywordList...)
+		candidates = append(candidates, m.tableNames...)
+	}
+
+	seen := make(map[string]struct{}, len(candidates))
+	filtered := make([]string, 0, 10)
+	for _, c := range candidates {
+		if c == "" {
+			continue
+		}
+		k := strings.ToLower(c)
+		if _, ok := seen[k]; ok {
+			continue
+		}
+		seen[k] = struct{}{}
+
+		if prefixLower == "" || strings.HasPrefix(strings.ToLower(c), prefixLower) || strings.HasPrefix(strings.ToUpper(c), prefixUpper) {
+			filtered = append(filtered, c)
+		}
+	}
+
+	sort.Strings(filtered)
+	if len(filtered) > 10 {
+		filtered = filtered[:10]
+	}
+
+	return filtered
+}
+
+func lastSQLToken(s string) string {
+	if s == "" {
+		return ""
+	}
+	parts := strings.Fields(s)
+	if len(parts) == 0 {
+		return ""
+	}
+	return parts[len(parts)-1]
 }
 
 // View renders the editor.
@@ -335,20 +464,40 @@ func (m Model) View() string {
 
 	title := titleStyle.Render("Query Editor")
 
-	var completionHint string
-	if m.completing && len(m.completions) > 1 {
-		hint := make([]string, 0, len(m.completions))
-		for i, c := range m.completions {
-			if i == m.compIndex {
-				hint = append(hint, lipgloss.NewStyle().Foreground(theme.ColorHighlight).Bold(true).Render(c))
-			} else {
-				hint = append(hint, theme.StyleMuted.Render(c))
-			}
-		}
-		completionHint = "\n" + lipgloss.NewStyle().Padding(0, 1).Render(
-			theme.StyleMuted.Render("Tab: ")+strings.Join(hint, " │ "),
-		)
+	editorView := title + "\n" + m.textarea.View()
+
+	if !m.showingCompletions || len(m.completions) == 0 {
+		return editorView
 	}
 
-	return title + "\n" + m.textarea.View() + completionHint
+	return lipgloss.JoinVertical(lipgloss.Left, editorView, m.renderCompletionDropdown())
+}
+
+func (m Model) renderCompletionDropdown() string {
+	itemStyle := lipgloss.NewStyle().Padding(0, 1)
+	selectedStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("0")).
+		Background(theme.ColorHighlight).
+		Bold(true).
+		Padding(0, 1)
+
+	items := make([]string, 0, len(m.completions))
+	for i, c := range m.completions {
+		if i == m.completionIndex {
+			items = append(items, selectedStyle.Render(c))
+		} else {
+			items = append(items, itemStyle.Render(c))
+		}
+	}
+
+	dropdown := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(theme.ColorPrimary).
+		Padding(0, 0).
+		MaxWidth(max(20, m.width-4)).
+		Render(lipgloss.JoinVertical(lipgloss.Left, items...))
+
+	hint := theme.StyleMuted.Render("  ↑/↓ navigate | Enter/Tab accept | Esc cancel")
+
+	return lipgloss.JoinVertical(lipgloss.Left, dropdown, hint)
 }
