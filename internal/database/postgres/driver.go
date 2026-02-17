@@ -201,6 +201,30 @@ func formatCell(v any) string {
 		return val
 	case []byte:
 		return formatBytes(val)
+	case [16]byte:
+		u, err := uuid.FromBytes(val[:])
+		if err == nil {
+			return u.String()
+		}
+		return formatBytes(val[:])
+	case pgtype.UUID:
+		if !val.Valid {
+			return "null"
+		}
+		u, err := uuid.FromBytes(val.Bytes[:])
+		if err == nil {
+			return u.String()
+		}
+		return val.String()
+	case *pgtype.UUID:
+		if val == nil || !val.Valid {
+			return "null"
+		}
+		u, err := uuid.FromBytes(val.Bytes[:])
+		if err == nil {
+			return u.String()
+		}
+		return val.String()
 	case time.Time:
 		return val.Format("2006-01-02 15:04:05")
 	case pgtype.Timestamp:
