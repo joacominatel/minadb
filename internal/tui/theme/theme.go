@@ -8,6 +8,7 @@ var (
 	ColorSecondary = lipgloss.Color("241") // Gray
 	ColorSuccess   = lipgloss.Color("42")  // Green
 	ColorError     = lipgloss.Color("196") // Red
+	ColorWarning   = lipgloss.Color("214") // Orange
 	ColorBorder    = lipgloss.Color("238") // Dark gray
 	ColorMuted     = lipgloss.Color("245") // Light gray
 	ColorHighlight = lipgloss.Color("229") // Yellow
@@ -40,4 +41,11 @@ var (
 			Background(lipgloss.Color("236")).
 			Foreground(lipgloss.Color("252")).
 			Padding(0, 1)
+
+	StyleWarning = lipgloss.NewStyle().
+			Foreground(ColorWarning)
+
+	StyleDanger = lipgloss.NewStyle().
+			Foreground(ColorError).
+			Bold(true)
 )
