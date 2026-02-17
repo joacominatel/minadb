@@ -68,6 +68,21 @@ func (s *Service) LoadSchemaTree(ctx context.Context) (*SchemaTree, error) {
 	return tree, nil
 }
 
+// AllTableNames returns all schema-qualified table names (for autocompletion).
+func (s *Service) AllTableNames(tree *SchemaTree) []string {
+	var names []string
+	for _, schema := range tree.Schemas {
+		for _, table := range schema.Tables {
+			// Add both unqualified and schema-qualified names
+			names = append(names, table)
+			if schema.Name != "public" {
+				names = append(names, schema.Name+"."+table)
+			}
+		}
+	}
+	return names
+}
+
 // LoadColumns fetches column metadata for a specific table.
 func (s *Service) LoadColumns(ctx context.Context, schema, table string) ([]database.Column, error) {
 	return s.driver.GetColumns(ctx, schema, table)
