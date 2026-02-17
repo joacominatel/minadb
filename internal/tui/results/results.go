@@ -12,13 +12,13 @@ import (
 
 // Model is the query results component.
 type Model struct {
-	result   *database.QueryResult
-	err      error
-	width    int
-	height   int
-	focused  bool
-	scrollY  int
-	loading  bool
+	result    *database.QueryResult
+	err       error
+	width     int
+	height    int
+	focused   bool
+	scrollY   int
+	loading   bool
 	colWidths []int
 }
 
@@ -72,23 +72,28 @@ func (m *Model) calculateColumnWidths() {
 	}
 
 	m.colWidths = make([]int, len(m.result.Columns))
+
+	// Use display width (not byte length) for accurate measurement
 	for i, col := range m.result.Columns {
-		m.colWidths[i] = len(col)
+		m.colWidths[i] = lipgloss.Width(col)
 	}
 
 	for _, row := range m.result.Rows {
 		for i, cell := range row {
-			if i < len(m.colWidths) && len(cell) > m.colWidths[i] {
-				m.colWidths[i] = len(cell)
+			w := lipgloss.Width(cell)
+			if i < len(m.colWidths) && w > m.colWidths[i] {
+				m.colWidths[i] = w
 			}
 		}
 	}
 
-	// Cap column widths to prevent overflow
-	maxColWidth := 40
+	// Enforce minimum of 1 and cap at 40
 	for i := range m.colWidths {
-		if m.colWidths[i] > maxColWidth {
-			m.colWidths[i] = maxColWidth
+		if m.colWidths[i] < 1 {
+			m.colWidths[i] = 1
+		}
+		if m.colWidths[i] > 40 {
+			m.colWidths[i] = 40
 		}
 	}
 }
@@ -185,7 +190,7 @@ func (m Model) View() string {
 	b.WriteString("\n")
 
 	// Visible rows
-	visibleRows := m.height - 4 // header + title + separator + padding
+	visibleRows := m.height - 4
 	if visibleRows < 1 {
 		visibleRows = 1
 	}
@@ -208,15 +213,34 @@ func (m Model) renderRow(cells []string, isHeader bool) string {
 		if i < len(m.colWidths) {
 			width = m.colWidths[i]
 		}
-
-		// Truncate cell content
-		display := cell
-		if len(display) > width {
-			display = display[:width-1] + "…"
+		if width < 1 {
+			width = 1
 		}
 
-		// Pad to width
-		display = display + strings.Repeat(" ", width-len(display))
+		display := cell
+		displayWidth := lipgloss.Width(display)
+
+		// Truncate if display is wider than column
+		if displayWidth > width {
+			runes := []rune(display)
+			if width > 1 && len(runes) > 0 {
+				// Trim runes until we fit (accounting for the ellipsis)
+				trimmed := runes
+				for lipgloss.Width(string(trimmed))>= width && len(trimmed) > 0 {
+					trimmed = trimmed[:len(trimmed)-1]
+				}
+				display = string(trimmed) + "…"
+			} else {
+				display = "…"
+			}
+			displayWidth = lipgloss.Width(display)
+		}
+
+		// Pad to column width; guard against negative (never panic)
+		pad := width - displayWidth
+		if pad > 0 {
+			display += strings.Repeat(" ", pad)
+		}
 
 		if isHeader {
 			parts[i] = lipgloss.NewStyle().
@@ -233,6 +257,9 @@ func (m Model) renderRow(cells []string, isHeader bool) string {
 func (m Model) renderSeparator() string {
 	parts := make([]string, len(m.colWidths))
 	for i, w := range m.colWidths {
+		if w < 1 {
+			w = 1
+		}
 		parts[i] = strings.Repeat("─", w)
 	}
 	return "  " + lipgloss.NewStyle().Foreground(theme.ColorBorder).Render(strings.Join(parts, "─┼─"))
