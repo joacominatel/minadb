@@ -42,6 +42,11 @@ type flatItem struct {
 	depth int
 }
 
+// QuickQueryMsg is sent when the user requests a quick SELECT on a table.
+type QuickQueryMsg struct {
+	Query string
+}
+
 // Model is the explorer (schema tree) component.
 type Model struct {
 	tree    *TreeNode
@@ -219,10 +224,64 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 			return m, m.toggleExpand()
 		case "left", "h":
 			return m, m.collapse()
+		case "s":
+			// Quick SELECT on the selected table
+			return m, m.quickSelect()
+		case "d":
+			// Describe table (count query)
+			return m, m.describeTable()
 		}
 	}
 
 	return m, nil
+}
+
+// quickSelect generates a SELECT * FROM table LIMIT 100 query.
+func (m *Model) quickSelect() tea.Cmd {
+	schema, table, ok := m.SelectedTable()
+	if !ok {
+		return nil
+	}
+
+	var query string
+	if schema == "public" {
+		query = fmt.Sprintf("SELECT * FROM %s LIMIT 100;", quoteIdent(table))
+	} else {
+		query = fmt.Sprintf("SELECT * FROM %s.%s LIMIT 100;", quoteIdent(schema), quoteIdent(table))
+	}
+
+	return func() tea.Msg {
+		return QuickQueryMsg{Query: query}
+	}
+}
+
+// describeTable generates a SELECT count(*) query.
+func (m *Model) describeTable() tea.Cmd {
+	schema, table, ok := m.SelectedTable()
+	if !ok {
+		return nil
+	}
+
+	var query string
+	if schema == "public" {
+		query = fmt.Sprintf("SELECT count(*) FROM %s;", quoteIdent(table))
+	} else {
+		query = fmt.Sprintf("SELECT count(*) FROM %s.%s;", quoteIdent(schema), quoteIdent(table))
+	}
+
+	return func() tea.Msg {
+		return QuickQueryMsg{Query: query}
+	}
+}
+
+// quoteIdent quotes an identifier if it contains special characters.
+func quoteIdent(name string) string {
+	for _, c := range name {
+		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') {
+			return "\"" + strings.ReplaceAll(name, "\"", "\"\"") + "\""
+		}
+	}
+	return name
 }
 
 func (m *Model) toggleExpand() tea.Cmd {
@@ -276,7 +335,7 @@ type requestColumnsMsg struct {
 	Table  string
 }
 
-// RequestColumnsMsg returns the message type for external use.
+// IsRequestColumnsMsg checks whether a message is a column load request.
 func IsRequestColumnsMsg(msg tea.Msg) (schema, table string, ok bool) {
 	if m, ok := msg.(requestColumnsMsg); ok {
 		return m.Schema, m.Table, true
@@ -306,7 +365,7 @@ func (m Model) View() string {
 	b.WriteString("\n")
 
 	// Calculate visible area
-	visibleHeight := m.height - 2 // title + padding
+	visibleHeight := m.height - 2
 	if visibleHeight < 1 {
 		visibleHeight = 1
 	}
@@ -364,9 +423,12 @@ func (m Model) renderNode(item flatItem, selected bool) string {
 
 	line := indent + icon + name
 
-	// Truncate to width
-	if m.width > 0 && lipgloss.Width(line) > m.width-2 {
-		line = line[:m.width-4] + ".."
+	// Truncate to width safely
+	if m.width > 4 && lipgloss.Width(line) > m.width-2 {
+		runes := []rune(line)
+		if len(runes) > m.width-4 {
+			line = string(runes[:m.width-4]) + ".."
+		}
 	}
 
 	if selected {
