@@ -1,11 +1,17 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
+	"unicode/utf8"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joacominatel/minadb/internal/database"
 )
@@ -163,11 +169,7 @@ func (d *Driver) ExecuteQuery(ctx context.Context, query string) (*database.Quer
 		}
 		row := make([]string, len(values))
 		for i, v := range values {
-			if v == nil {
-				row[i] = "NULL"
-			} else {
-				row[i] = fmt.Sprintf("%v", v)
-			}
+			row[i] = formatCell(v)
 		}
 		resultRows = append(resultRows, row)
 	}
@@ -187,4 +189,120 @@ func (d *Driver) ExecuteQuery(ctx context.Context, query string) (*database.Quer
 // DatabaseName returns the name of the connected database.
 func (d *Driver) DatabaseName() string {
 	return d.dbName
+}
+
+func formatCell(v any) string {
+	if v == nil {
+		return "null"
+	}
+
+	switch val := v.(type) {
+	case string:
+		return val
+	case []byte:
+		return formatBytes(val)
+	case time.Time:
+		return val.Format("2006-01-02 15:04:05")
+	case pgtype.Timestamp:
+		return formatTimestamp(val.Time, val.Valid, val.InfinityModifier)
+	case *pgtype.Timestamp:
+		if val == nil {
+			return "null"
+		}
+		return formatTimestamp(val.Time, val.Valid, val.InfinityModifier)
+	case pgtype.Timestamptz:
+		return formatTimestamp(val.Time, val.Valid, val.InfinityModifier)
+	case *pgtype.Timestamptz:
+		if val == nil {
+			return "null"
+		}
+		return formatTimestamp(val.Time, val.Valid, val.InfinityModifier)
+	case pgtype.Numeric:
+		return formatNumeric(val)
+	case *pgtype.Numeric:
+		if val == nil {
+			return "null"
+		}
+		return formatNumeric(*val)
+	case map[string]any, []any:
+		if b, err := json.Marshal(val); err == nil {
+			return string(b)
+		}
+	}
+
+	if b, err := json.Marshal(v); err == nil {
+		if json.Valid(b) && (strings.HasPrefix(string(b), "[") || strings.HasPrefix(string(b), "{")) {
+			return string(b)
+		}
+	}
+
+	return fmt.Sprintf("%v", v)
+}
+
+func formatBytes(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+
+	if len(b) == 16 {
+		if u, err := uuid.FromBytes(b); err == nil {
+			return u.String()
+		}
+	}
+
+	if json.Valid(b) {
+		var compact bytes.Buffer
+		if err := json.Compact(&compact, b); err == nil {
+			return compact.String()
+		}
+	}
+
+	if utf8.Valid(b) {
+		return string(b)
+	}
+
+	return fmt.Sprintf("0x%x", b)
+}
+
+func formatTimestamp(t time.Time, valid bool, inf pgtype.InfinityModifier) string {
+	if !valid {
+		return "null"
+	}
+	if inf == pgtype.Infinity {
+		return "infinity"
+	}
+	if inf == pgtype.NegativeInfinity {
+		return "-infinity"
+	}
+	return t.Format("2006-01-02 15:04:05")
+}
+
+func formatNumeric(n pgtype.Numeric) string {
+	if !n.Valid {
+		return "null"
+	}
+	if n.NaN {
+		return "NaN"
+	}
+	if n.InfinityModifier == pgtype.Infinity {
+		return "infinity"
+	}
+	if n.InfinityModifier == pgtype.NegativeInfinity {
+		return "-infinity"
+	}
+
+	f8, err := n.Float64Value()
+	if err == nil && f8.Valid {
+		return fmt.Sprintf("%.2f", f8.Float64)
+	}
+
+	b, err := n.MarshalJSON()
+	if err == nil {
+		s := strings.Trim(string(b), "\"")
+		if s != "" && s != "null" {
+			return s
+		}
+	}
+
+	return "0.00"
 }
