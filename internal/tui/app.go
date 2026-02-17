@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
@@ -9,6 +10,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/joacominatel/minadb/internal/app"
+	"github.com/joacominatel/minadb/internal/config"
 	"github.com/joacominatel/minadb/internal/database"
 	"github.com/joacominatel/minadb/internal/tui/editor"
 	"github.com/joacominatel/minadb/internal/tui/explorer"
@@ -39,17 +41,19 @@ func (p Pane) String() string {
 	}
 }
 
-// AppMode tracks whether we're connecting or in the main UI.
+// AppMode tracks the current UI state.
 type AppMode int
 
 const (
-	ModeConnect AppMode = iota
-	ModeMain
+	ModeSelectConnection AppMode = iota // show saved connections list
+	ModeConnect                         // manual DSN input
+	ModeMain                            // main TUI
 )
 
 // Custom messages for async operations.
 type (
 	connectedMsg struct {
+		dsn string
 		err error
 	}
 	schemaLoadedMsg struct {
@@ -66,11 +70,15 @@ type (
 		columns []database.Column
 		err     error
 	}
+	connectionSavedMsg struct {
+		err error
+	}
 )
 
 // Model is the top-level bubbletea model orchestrating all components.
 type Model struct {
 	service    *app.Service
+	cfg        *config.Config
 	explorer   explorer.Model
 	editor     editor.Model
 	results    results.Model
@@ -83,25 +91,36 @@ type Model struct {
 	err        error
 	showHelp   bool
 	initialDSN string
+
+	// Connection selection
+	connCursor int
+	connDSN    string // the DSN used for current connection (for saving)
 }
 
 // NewModel creates the top-level model.
-func NewModel(service *app.Service, dsn string) Model {
+func NewModel(service *app.Service, cfg *config.Config, dsn string) Model {
 	ti := textinput.New()
 	ti.Placeholder = "postgresql://user:password@localhost:5432/dbname?sslmode=disable"
 	ti.Focus()
 	ti.CharLimit = 500
 	ti.Width = 70
 
+	// Decide initial mode
+	mode := ModeConnect
+	if dsn == "" && len(cfg.Connections) > 0 {
+		mode = ModeSelectConnection
+	}
+
 	m := Model{
 		service:    service,
+		cfg:        cfg,
 		explorer:   explorer.New(),
 		editor:     editor.New(),
 		results:    results.New(),
 		statusbar:  statusbar.New(),
 		connInput:  ti,
 		activePane: PaneExplorer,
-		mode:       ModeConnect,
+		mode:       mode,
 		initialDSN: dsn,
 	}
 
@@ -114,7 +133,7 @@ func (m Model) Init() tea.Cmd {
 		textinput.Blink,
 	}
 
-	// If a DSN was provided, connect immediately
+	// If a DSN was provided via flag, connect immediately
 	if m.initialDSN != "" {
 		cmds = append(cmds, m.connectCmd(m.initialDSN))
 	}
@@ -124,9 +143,17 @@ func (m Model) Init() tea.Cmd {
 
 // Update handles all messages.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	// Check for explorer column requests (from async commands)
+	// Check for explorer column requests
 	if schema, table, ok := explorer.IsRequestColumnsMsg(msg); ok {
 		return m, m.loadColumnsCmd(schema, table)
+	}
+
+	// Handle quick query from explorer
+	if qm, ok := msg.(explorer.QuickQueryMsg); ok {
+		m.editor.SetQuery(qm.Query)
+		m.results.SetLoading(true)
+		m.statusbar.SetMessage("Executing query...")
+		return m, m.executeQueryCmd(qm.Query)
 	}
 
 	switch msg := msg.(type) {
@@ -143,7 +170,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 
-		// Help toggle (not in connect mode, and not when editor is focused)
+		// Help toggle
 		if msg.String() == "?" && m.mode == ModeMain && m.activePane != PaneEditor {
 			m.showHelp = !m.showHelp
 			return m, nil
@@ -155,27 +182,41 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// Mode-specific key handling
-		if m.mode == ModeConnect {
+		switch m.mode {
+		case ModeSelectConnection:
+			return m.updateSelectConnection(msg)
+		case ModeConnect:
 			return m.updateConnect(msg)
+		case ModeMain:
+			return m.updateMain(msg)
 		}
-
-		return m.updateMain(msg)
 
 	case connectedMsg:
 		if msg.err != nil {
 			m.err = msg.err
-			if m.mode == ModeConnect {
-				m.statusbar.SetMessage("Connection failed: " + msg.err.Error())
-			}
+			m.statusbar.SetMessage("Connection failed: " + msg.err.Error())
 			return m, nil
 		}
+		m.connDSN = msg.dsn
 		m.mode = ModeMain
 		m.err = nil
 		m.explorer.SetLoading(true)
 		m.statusbar.SetConnected(true, m.service.DatabaseName())
 		m.setFocus(PaneExplorer)
 		m.layout()
-		return m, m.loadSchemaCmd()
+
+		// Save connection in background
+		cmds := []tea.Cmd{m.loadSchemaCmd()}
+		if msg.dsn != "" {
+			cmds = append(cmds, m.saveConnectionCmd(msg.dsn))
+		}
+		return m, tea.Batch(cmds...)
+
+	case connectionSavedMsg:
+		if msg.err != nil {
+			m.statusbar.SetMessage("Warning: could not save connection")
+		}
+		return m, nil
 
 	case schemaLoadedMsg:
 		if msg.err != nil {
@@ -186,6 +227,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.explorer.SetTree(msg.tree)
 		m.statusbar.SetMessage("")
+		// Cache table names for editor autocompletion
+		tableNames := m.service.AllTableNames(msg.tree)
+		m.editor.SetTableNames(tableNames)
 		return m, nil
 
 	case queryExecutedMsg:
@@ -221,6 +265,40 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m Model) updateSelectConnection(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	connCount := len(m.cfg.Connections)
+
+	switch msg.String() {
+	case "up", "k":
+		if m.connCursor > 0 {
+			m.connCursor--
+		}
+	case "down", "j":
+		if m.connCursor < connCount { // connCount = last item is "New connection"
+			m.connCursor++
+		}
+	case "enter":
+		if m.connCursor < connCount {
+			// Selected a saved connection
+			conn := m.cfg.Connections[m.connCursor]
+			m.statusbar.SetMessage("Connecting to " + conn.Name + "...")
+			return m, m.connectCmd(conn.DSN())
+		}
+		// "New connection" selected
+		m.mode = ModeConnect
+		m.connInput.Focus()
+		return m, nil
+	case "n":
+		m.mode = ModeConnect
+		m.connInput.Focus()
+		return m, nil
+	case "q":
+		return m, tea.Quit
+	}
+
+	return m, nil
+}
+
 func (m Model) updateConnect(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "enter":
@@ -230,6 +308,11 @@ func (m Model) updateConnect(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, m.connectCmd(dsn)
 		}
 		return m, nil
+	case "esc":
+		if len(m.cfg.Connections) > 0 {
+			m.mode = ModeSelectConnection
+			return m, nil
+		}
 	case "q":
 		if m.connInput.Value() == "" {
 			return m, tea.Quit
@@ -244,7 +327,6 @@ func (m Model) updateConnect(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m Model) updateMain(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "q":
-		// Only quit from explorer or results, not while typing in editor
 		if m.activePane != PaneEditor {
 			return m, tea.Quit
 		}
@@ -312,7 +394,6 @@ func (m *Model) layout() {
 	statusHeight := 1
 	availHeight := m.height - statusHeight
 
-	// Explorer takes ~25% width, min 22, max 35
 	explorerWidth := m.width / 4
 	if explorerWidth < 22 {
 		explorerWidth = 22
@@ -323,7 +404,6 @@ func (m *Model) layout() {
 
 	rightWidth := m.width - explorerWidth - 1
 
-	// Editor takes 40% of available height
 	editorHeight := availHeight * 40 / 100
 	if editorHeight < 5 {
 		editorHeight = 5
@@ -344,7 +424,19 @@ func (m Model) connectCmd(dsn string) tea.Cmd {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		err := service.Connect(ctx, dsn)
-		return connectedMsg{err: err}
+		return connectedMsg{dsn: dsn, err: err}
+	}
+}
+
+func (m Model) saveConnectionCmd(dsn string) tea.Cmd {
+	cfg := m.cfg
+	return func() tea.Msg {
+		conn, err := config.ParseDSN(dsn)
+		if err != nil {
+			return connectionSavedMsg{err: err}
+		}
+		err = config.SaveConnection(cfg, conn)
+		return connectionSavedMsg{err: err}
 	}
 }
 
@@ -384,11 +476,80 @@ func (m Model) View() string {
 		return m.viewHelp()
 	}
 
-	if m.mode == ModeConnect {
+	switch m.mode {
+	case ModeSelectConnection:
+		return m.viewSelectConnection()
+	case ModeConnect:
 		return m.viewConnect()
+	default:
+		return m.viewMain()
+	}
+}
+
+func (m Model) viewSelectConnection() string {
+	titleStyle := lipgloss.NewStyle().
+		Foreground(theme.ColorPrimary).
+		Bold(true).
+		Padding(1, 0)
+	subtitleStyle := lipgloss.NewStyle().Foreground(theme.ColorMuted)
+
+	title := titleStyle.Render("minadb")
+	subtitle := subtitleStyle.Render("Fast. Private. Terminal-native.")
+
+	sectionTitle := lipgloss.NewStyle().
+		Foreground(theme.ColorPrimary).
+		Bold(true).
+		Render("Saved Connections")
+
+	var items []string
+	for i, conn := range m.cfg.Connections {
+		label := fmt.Sprintf("  %s (%s)", conn.Name, conn.DisplayString())
+		if i == m.connCursor {
+			label = lipgloss.NewStyle().
+				Foreground(theme.ColorHighlight).
+				Bold(true).
+				Render("> " + conn.Name + " (" + conn.DisplayString() + ")")
+		}
+		items = append(items, label)
 	}
 
-	return m.viewMain()
+	// "New connection" option
+	newLabel := "  [New Connection]"
+	if m.connCursor == len(m.cfg.Connections) {
+		newLabel = lipgloss.NewStyle().
+			Foreground(theme.ColorHighlight).
+			Bold(true).
+			Render("> [New Connection]")
+	}
+	items = append(items, "")
+	items = append(items, newLabel)
+
+	var errMsg string
+	if m.err != nil {
+		errMsg = "\n" + theme.StyleError.Render("  Error: "+m.err.Error())
+	}
+
+	hints := theme.StyleMuted.Render("  ↑/↓: Navigate  Enter: Connect  n: New  q: Quit")
+
+	parts := []string{
+		"",
+		title,
+		subtitle,
+		"",
+		sectionTitle,
+	}
+	parts = append(parts, items...)
+	if errMsg != "" {
+		parts = append(parts, errMsg)
+	}
+	parts = append(parts, "", hints)
+
+	content := lipgloss.JoinVertical(lipgloss.Left, parts...)
+
+	return lipgloss.Place(m.width, m.height,
+		lipgloss.Center, lipgloss.Center,
+		content,
+	)
 }
 
 func (m Model) viewConnect() string {
@@ -412,7 +573,11 @@ func (m Model) viewConnect() string {
 		errMsg = "\n" + theme.StyleError.Render("  Error: "+m.err.Error())
 	}
 
-	hint := theme.StyleMuted.Render("  Press Enter to connect, Ctrl+C to quit")
+	backHint := ""
+	if len(m.cfg.Connections) > 0 {
+		backHint = "  Esc: Back │ "
+	}
+	hint := theme.StyleMuted.Render("  " + backHint + "Enter: Connect │ Ctrl+C: Quit")
 
 	content := lipgloss.JoinVertical(lipgloss.Left,
 		"",
@@ -426,7 +591,6 @@ func (m Model) viewConnect() string {
 		hint,
 	)
 
-	// Center on screen
 	return lipgloss.Place(m.width, m.height,
 		lipgloss.Center, lipgloss.Center,
 		content,
@@ -450,14 +614,13 @@ func (m Model) viewMain() string {
 	rightWidth := m.width - explorerWidth - 1
 
 	statusHeight := 1
-	availHeight := m.height - statusHeight - 2 // account for borders
+	availHeight := m.height - statusHeight - 2
 
 	explorerView := explorerBorder.
 		Width(explorerWidth - 2).
 		Height(availHeight).
 		Render(m.explorer.View())
 
-	// Right pane: editor on top, results on bottom
 	editorHeight := availHeight * 40 / 100
 	if editorHeight < 5 {
 		editorHeight = 5
@@ -528,10 +691,14 @@ func (m Model) viewHelp() string {
 		keyStyle.Render("  ↑/k  ↓/j")+"     "+descStyle.Render("Navigate up/down"),
 		keyStyle.Render("  Enter/→/l")+"     "+descStyle.Render("Expand item"),
 		keyStyle.Render("  ←/h")+"           "+descStyle.Render("Collapse item"),
+		keyStyle.Render("  s")+"             "+descStyle.Render("Quick SELECT * LIMIT 100"),
+		keyStyle.Render("  d")+"             "+descStyle.Render("Count rows"),
 		"",
 		sectionStyle.Render("Editor"),
 		keyStyle.Render("  Ctrl+E / F5")+"   "+descStyle.Render("Execute query"),
 		keyStyle.Render("  Ctrl+K")+"        "+descStyle.Render("Clear editor"),
+		keyStyle.Render("  Ctrl+L")+"        "+descStyle.Render("Format (uppercase keywords)"),
+		keyStyle.Render("  Tab")+"           "+descStyle.Render("Autocomplete table name"),
 		"",
 		sectionStyle.Render("Results"),
 		keyStyle.Render("  ↑/k  ↓/j")+"     "+descStyle.Render("Scroll results"),
