@@ -143,6 +143,11 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		if msg.Type == tea.KeyCtrlAt || msg.Type == tea.KeyNull {
+			m.openCompletions()
+			return m, nil
+		}
+
 		key := msg.String()
 
 		switch key {
@@ -165,7 +170,7 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 			m.formatKeywords()
 			return m, nil
 
-		case "ctrl+space":
+		case "ctrl+space", "ctrl+@":
 			m.openCompletions()
 			return m, nil
 
