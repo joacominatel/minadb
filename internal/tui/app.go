@@ -331,6 +331,9 @@ func (m Model) updateMain(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 	case "tab":
+		if m.activePane == PaneEditor && m.editor.CompletionActive() {
+			return m.updateComponents(msg)
+		}
 		m.cyclePane()
 		return m, nil
 	case "shift+tab":
@@ -697,11 +700,15 @@ func (m Model) viewHelp() string {
 		sectionStyle.Render("Editor"),
 		keyStyle.Render("  Ctrl+E / F5")+"   "+descStyle.Render("Execute query"),
 		keyStyle.Render("  Ctrl+K")+"        "+descStyle.Render("Clear editor"),
-		keyStyle.Render("  Ctrl+L")+"        "+descStyle.Render("Format (uppercase keywords)"),
-		keyStyle.Render("  Tab")+"           "+descStyle.Render("Autocomplete table name"),
+		keyStyle.Render("  Ctrl+L")+"        "+descStyle.Render("Format query (uppercase keywords)"),
+		keyStyle.Render("  Auto")+"          "+descStyle.Render("Keywords uppercase on space/newline/;"),
+		keyStyle.Render("  Ctrl+Space")+"    "+descStyle.Render("Open autocomplete"),
+		keyStyle.Render("  ↑/↓ Enter Tab")+" "+descStyle.Render("Navigate/accept completion"),
+		keyStyle.Render("  Esc")+"           "+descStyle.Render("Cancel completion"),
 		"",
 		sectionStyle.Render("Results"),
 		keyStyle.Render("  ↑/k  ↓/j")+"     "+descStyle.Render("Scroll results"),
+		keyStyle.Render("  ←/h  →/l")+"     "+descStyle.Render("Scroll visible columns"),
 		keyStyle.Render("  PgUp/PgDn")+"     "+descStyle.Render("Page up/down"),
 		"",
 		theme.StyleMuted.Render("Press any key to close"),
