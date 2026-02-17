@@ -62,6 +62,7 @@ type (
 	}
 	queryExecutedMsg struct {
 		result *database.QueryResult
+		query  string
 		err    error
 	}
 	columnsLoadedMsg struct {
@@ -240,7 +241,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.results.SetResult(msg.result)
+		m.results.SetLastQuery(msg.query)
 		m.statusbar.SetMessage("")
+		return m, nil
+
+	case results.SetEditorQueryMsg:
+		m.editor.SetQuery(msg.Query)
+		m.setFocus(PaneEditor)
+		return m, nil
+
+	case results.StatusNotifyMsg:
+		m.statusbar.SetMessage(msg.Message)
 		return m, nil
 
 	case columnsLoadedMsg:
@@ -459,7 +470,7 @@ func (m Model) executeQueryCmd(query string) tea.Cmd {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		result, err := service.ExecuteQuery(ctx, query)
-		return queryExecutedMsg{result: result, err: err}
+		return queryExecutedMsg{result: result, query: query, err: err}
 	}
 }
 
@@ -707,9 +718,17 @@ func (m Model) viewHelp() string {
 		keyStyle.Render("  Esc")+"           "+descStyle.Render("Cancel completion"),
 		"",
 		sectionStyle.Render("Results"),
-		keyStyle.Render("  ↑/k  ↓/j")+"     "+descStyle.Render("Scroll results"),
-		keyStyle.Render("  ←/h  →/l")+"     "+descStyle.Render("Scroll visible columns"),
+		keyStyle.Render("  ↑/k  ↓/j")+"     "+descStyle.Render("Move row cursor"),
+		keyStyle.Render("  ←/h  →/l")+"     "+descStyle.Render("Move column cursor"),
 		keyStyle.Render("  PgUp/PgDn")+"     "+descStyle.Render("Page up/down"),
+		keyStyle.Render("  Home/End")+"      "+descStyle.Render("First/last column"),
+		keyStyle.Render("  g / G")+"         "+descStyle.Render("First/last row"),
+		keyStyle.Render("  Enter")+"         "+descStyle.Render("Record detail view"),
+		keyStyle.Render("  c")+"             "+descStyle.Render("Copy cell value"),
+		keyStyle.Render("  y")+"             "+descStyle.Render("Copy row (JSON/CSV/Text)"),
+		keyStyle.Render("  f")+"             "+descStyle.Render("Filter by current value"),
+		keyStyle.Render("  e")+"             "+descStyle.Render("Export results (JSON/CSV)"),
+		keyStyle.Render("  D")+"             "+descStyle.Render("Delete record"),
 		"",
 		theme.StyleMuted.Render("Press any key to close"),
 	)
