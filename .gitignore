@@ -1,0 +1,15 @@
+example/
+minadb
+minadb.exe
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.prof
+.env
+.DS_Store
+vendor/
+dist/
