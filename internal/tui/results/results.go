@@ -12,6 +12,17 @@ import (
 	"github.com/joacominatel/minadb/internal/tui/theme"
 )
 
+// ViewMode tracks what the results pane is currently showing
+type ViewMode int
+
+const (
+	ViewNormal        ViewMode = iota
+	ViewRecordDetail           // vertical single-record view
+	ViewCopyRowPrompt          // format picker for copy row
+	ViewExportPrompt           // format picker for export
+	ViewDeleteConfirm          // red delete warning
+)
+
 // Model is the query results component.
 type Model struct {
 	result    *database.QueryResult
@@ -21,9 +32,15 @@ type Model struct {
 	focused   bool
 	scrollY   int
 	cursorY   int
+	cursorX   int
 	colOffset int
 	loading   bool
 	colWidths []int
+
+	viewMode      ViewMode
+	menuCursor    int    // field selector in record detail
+	lastQuery     string // SQL that produced the current result
+	statusMessage string // temporary feedback
 }
 
 // New creates a new results model.
@@ -58,8 +75,12 @@ func (m *Model) SetResult(r *database.QueryResult) {
 	m.err = nil
 	m.scrollY = 0
 	m.cursorY = 0
+	m.cursorX = 0
 	m.colOffset = 0
 	m.loading = false
+	m.viewMode = ViewNormal
+	m.menuCursor = 0
+	m.statusMessage = ""
 	m.calculateColumnWidths()
 }
 
@@ -69,8 +90,22 @@ func (m *Model) SetError(err error) {
 	m.result = nil
 	m.scrollY = 0
 	m.cursorY = 0
+	m.cursorX = 0
 	m.colOffset = 0
 	m.loading = false
+	m.viewMode = ViewNormal
+	m.menuCursor = 0
+	m.statusMessage = ""
+}
+
+// SetLastQuery stores the SQL that produced the current result.
+func (m *Model) SetLastQuery(q string) {
+	m.lastQuery = q
+}
+
+// HasResult reports whether there's a result with columns.
+func (m Model) HasResult() bool {
+	return m.result != nil && len(m.result.Columns) > 0
 }
 
 func (m *Model) calculateColumnWidths() {
@@ -80,8 +115,6 @@ func (m *Model) calculateColumnWidths() {
 	}
 
 	m.colWidths = make([]int, len(m.result.Columns))
-
-	// Use display width (not byte length) for accurate measurement
 	for i, col := range m.result.Columns {
 		m.colWidths[i] = lipgloss.Width(col)
 	}
@@ -95,7 +128,6 @@ func (m *Model) calculateColumnWidths() {
 		}
 	}
 
-	// Keep columns readable but bounded.
 	for i := range m.colWidths {
 		if m.colWidths[i] < 8 {
 			m.colWidths[i] = 8
@@ -111,7 +143,8 @@ func (m Model) Init() tea.Cmd {
 	return nil
 }
 
-// Update handles messages for the results pane.
+// ── Update ──────────────────────────────────────────────────────────────
+
 func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 	if !m.focused {
 		return m, nil
@@ -119,50 +152,186 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		switch msg.String() {
-		case "up", "k":
-			if m.result != nil && m.cursorY > 0 {
-				m.cursorY--
-				m.ensureVerticalWindow()
-			}
-		case "down", "j":
-			if m.result != nil && m.cursorY < m.result.RowCount-1 {
-				m.cursorY++
-				m.ensureVerticalWindow()
-			}
-		case "pgup":
-			if m.result != nil {
-				step := max(1, m.visibleRows())
-				m.cursorY -= step
-				if m.cursorY < 0 {
-					m.cursorY = 0
-				}
-				m.ensureVerticalWindow()
-			}
-		case "pgdown":
-			if m.result != nil {
-				step := max(1, m.visibleRows())
-				m.cursorY += step
-				if m.cursorY > m.result.RowCount-1 {
-					m.cursorY = m.result.RowCount - 1
-				}
-				m.ensureVerticalWindow()
-			}
-		case "left", "h":
-			if m.colOffset > 0 {
-				m.colOffset--
-			}
-		case "right", "l":
-			if m.result != nil && m.colOffset < len(m.result.Columns)-1 {
-				m.colOffset++
-			}
+		m.statusMessage = ""
+		switch m.viewMode {
+		case ViewRecordDetail:
+			return m.updateRecordDetail(msg)
+		case ViewCopyRowPrompt:
+			return m.updateCopyRowPrompt(msg)
+		case ViewExportPrompt:
+			return m.updateExportPrompt(msg)
+		case ViewDeleteConfirm:
+			return m.updateDeleteConfirm(msg)
+		default:
+			return m.updateNormal(msg)
 		}
 	}
 
 	return m, nil
 }
 
-// View renders the results pane.
+func (m Model) updateNormal(msg tea.KeyMsg) (Model, tea.Cmd) {
+	switch msg.String() {
+	// navigation
+	case "up", "k":
+		if m.result != nil && m.cursorY > 0 {
+			m.cursorY--
+			m.ensureVerticalWindow()
+		}
+	case "down", "j":
+		if m.result != nil && m.cursorY < m.result.RowCount-1 {
+			m.cursorY++
+			m.ensureVerticalWindow()
+		}
+	case "left", "h":
+		if m.result != nil && m.cursorX > 0 {
+			m.cursorX--
+			m.ensureHorizontalWindow()
+		}
+	case "right", "l":
+		if m.result != nil && m.cursorX < len(m.result.Columns)-1 {
+			m.cursorX++
+			m.ensureHorizontalWindow()
+		}
+	case "pgup":
+		if m.result != nil {
+			step := max(1, m.visibleRows())
+			m.cursorY -= step
+			if m.cursorY < 0 {
+				m.cursorY = 0
+			}
+			m.ensureVerticalWindow()
+		}
+	case "pgdown":
+		if m.result != nil {
+			step := max(1, m.visibleRows())
+			m.cursorY += step
+			if m.cursorY > m.result.RowCount-1 {
+				m.cursorY = m.result.RowCount - 1
+			}
+			m.ensureVerticalWindow()
+		}
+	case "home":
+		m.cursorX = 0
+		m.ensureHorizontalWindow()
+	case "end":
+		if m.result != nil && len(m.result.Columns) > 0 {
+			m.cursorX = len(m.result.Columns) - 1
+			m.ensureHorizontalWindow()
+		}
+	case "g":
+		m.cursorY = 0
+		m.ensureVerticalWindow()
+	case "G":
+		if m.result != nil && m.result.RowCount > 0 {
+			m.cursorY = m.result.RowCount - 1
+			m.ensureVerticalWindow()
+		}
+
+	// actions
+	case "c":
+		m.doCopyCell()
+	case "y":
+		if m.HasResult() {
+			m.viewMode = ViewCopyRowPrompt
+		}
+	case "e":
+		if m.HasResult() {
+			m.viewMode = ViewExportPrompt
+		}
+	case "D":
+		if m.HasResult() {
+			m.viewMode = ViewDeleteConfirm
+		}
+	case "enter":
+		if m.HasResult() {
+			m.viewMode = ViewRecordDetail
+			m.menuCursor = m.cursorX
+		}
+	case "f":
+		if m.HasResult() {
+			cmd := m.doFilterByValue()
+			return m, cmd
+		}
+	}
+
+	return m, nil
+}
+
+func (m Model) updateRecordDetail(msg tea.KeyMsg) (Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.viewMode = ViewNormal
+	case "up", "k":
+		if m.menuCursor > 0 {
+			m.menuCursor--
+		}
+	case "down", "j":
+		if m.result != nil && m.menuCursor < len(m.result.Columns)-1 {
+			m.menuCursor++
+		}
+	case "c":
+		m.doCopyCellAt(m.cursorY, m.menuCursor)
+	case "f":
+		if m.result != nil && m.menuCursor < len(m.result.Columns) {
+			origX := m.cursorX
+			m.cursorX = m.menuCursor
+			cmd := m.doFilterByValue()
+			m.cursorX = origX
+			m.viewMode = ViewNormal
+			return m, cmd
+		}
+	}
+	return m, nil
+}
+
+func (m Model) updateCopyRowPrompt(msg tea.KeyMsg) (Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.viewMode = ViewNormal
+	case "j":
+		m.doCopyRowJSON()
+		m.viewMode = ViewNormal
+	case "c":
+		m.doCopyRowCSV()
+		m.viewMode = ViewNormal
+	case "t":
+		m.doCopyRowText()
+		m.viewMode = ViewNormal
+	}
+	return m, nil
+}
+
+func (m Model) updateExportPrompt(msg tea.KeyMsg) (Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.viewMode = ViewNormal
+	case "j":
+		m.viewMode = ViewNormal
+		m.statusMessage = "Exporting JSON..."
+		return m, m.exportJSONCmd()
+	case "c":
+		m.viewMode = ViewNormal
+		m.statusMessage = "Exporting CSV..."
+		return m, m.exportCSVCmd()
+	}
+	return m, nil
+}
+
+func (m Model) updateDeleteConfirm(msg tea.KeyMsg) (Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "n":
+		m.viewMode = ViewNormal
+	case "y", "enter":
+		m.viewMode = ViewNormal
+		cmd := m.doGenerateDelete()
+		return m, cmd
+	}
+	return m, nil
+}
+
+// ── View ────────────────────────────────────────────────────────────────
+
 func (m Model) View() string {
 	titleStyle := lipgloss.NewStyle().
 		Foreground(theme.ColorPrimary).
@@ -183,7 +352,6 @@ func (m Model) View() string {
 			theme.StyleMuted.Render("  Execute a query to see results")
 	}
 
-	// Header with stats
 	stats := fmt.Sprintf("%d row(s) | %s",
 		m.result.RowCount,
 		m.result.Duration.Round(time.Microsecond).String(),
@@ -195,17 +363,28 @@ func (m Model) View() string {
 		return header + "\n" + theme.StyleSuccess.Render("  Query executed successfully")
 	}
 
+	if m.viewMode == ViewRecordDetail {
+		return header + "\n" + m.renderRecordDetail()
+	}
+
+	return header + "\n" + m.renderTableView()
+}
+
+func (m Model) renderTableView() string {
 	var b strings.Builder
-	b.WriteString(header)
-	b.WriteString("\n")
 
 	fromCol, toCol := m.visibleColumnRange()
 	tableCols := m.result.Columns[fromCol:toCol]
 	widths := slices.Clone(m.colWidths[fromCol:toCol])
 
+	activeCol := -1
+	if m.cursorX >= fromCol && m.cursorX < toCol {
+		activeCol = m.cursorX - fromCol
+	}
+
 	b.WriteString(m.renderTopBorder(widths))
 	b.WriteString("\n")
-	b.WriteString(m.renderRow(tableCols, widths, true, false))
+	b.WriteString(m.renderRow(tableCols, widths, true, false, activeCol))
 	b.WriteString("\n")
 	b.WriteString(m.renderSeparator(widths))
 	b.WriteString("\n")
@@ -213,37 +392,64 @@ func (m Model) View() string {
 	visibleRows := m.visibleRows()
 	rowEnd := min(len(m.result.Rows), m.scrollY+visibleRows)
 	for i := m.scrollY; i < rowEnd; i++ {
-		line := m.renderRow(m.result.Rows[i][fromCol:toCol], widths, false, i == m.cursorY)
+		line := m.renderRow(m.result.Rows[i][fromCol:toCol], widths, false, i == m.cursorY, activeCol)
 		b.WriteString(line)
 		b.WriteString("\n")
 	}
 	b.WriteString(m.renderBottomBorder(widths))
 	b.WriteString("\n")
-	b.WriteString(m.renderFooter(fromCol, toCol, visibleRows))
+
+	switch m.viewMode {
+	case ViewCopyRowPrompt:
+		b.WriteString(m.renderCopyRowPrompt())
+	case ViewExportPrompt:
+		b.WriteString(m.renderExportPrompt())
+	case ViewDeleteConfirm:
+		b.WriteString(m.renderDeleteConfirm())
+	default:
+		b.WriteString(m.renderNormalFooter(fromCol, toCol, visibleRows))
+	}
 
 	return b.String()
 }
 
-func (m Model) renderRow(cells []string, widths []int, isHeader bool, selected bool) string {
-	parts := make([]string, len(cells))
+func (m Model) renderRow(cells []string, widths []int, isHeader bool, selected bool, activeCol int) string {
+	var b strings.Builder
+
+	sepStyle := lipgloss.NewStyle()
+	if selected && !isHeader {
+		sepStyle = sepStyle.Background(lipgloss.Color("236"))
+	}
+
+	b.WriteString(sepStyle.Render("│"))
+
 	for i, cell := range cells {
+		if i > 0 {
+			b.WriteString(sepStyle.Render("│"))
+		}
+
 		width := widths[i]
 		display := fitCell(cell, width)
-		if isHeader {
-			display = lipgloss.NewStyle().
-				Bold(true).
-				Foreground(theme.ColorPrimary).
-				Render(display)
+		content := " " + display + " "
+
+		style := lipgloss.NewStyle()
+		switch {
+		case isHeader && activeCol >= 0 && i == activeCol:
+			style = style.Bold(true).Foreground(theme.ColorPrimary).Underline(true)
+		case isHeader:
+			style = style.Bold(true).Foreground(theme.ColorPrimary)
+		case selected && activeCol >= 0 && i == activeCol:
+			style = style.Background(theme.ColorPrimary).
+				Foreground(lipgloss.Color("255")).Bold(true)
+		case selected:
+			style = style.Background(lipgloss.Color("236"))
 		}
-		parts[i] = " " + display + " "
+
+		b.WriteString(style.Render(content))
 	}
-	line := "│" + strings.Join(parts, "│") + "│"
-	if selected {
-		line = lipgloss.NewStyle().
-			Background(lipgloss.Color("236")).
-			Render(line)
-	}
-	return line
+
+	b.WriteString(sepStyle.Render("│"))
+	return b.String()
 }
 
 func (m Model) renderTopBorder(widths []int) string {
@@ -303,6 +509,32 @@ func (m *Model) ensureVerticalWindow() {
 	}
 }
 
+func (m *Model) ensureHorizontalWindow() {
+	if m.result == nil || len(m.result.Columns) == 0 {
+		return
+	}
+	if m.cursorX < 0 {
+		m.cursorX = 0
+	}
+	if m.cursorX >= len(m.result.Columns) {
+		m.cursorX = len(m.result.Columns) - 1
+	}
+
+	// scroll left if cursor went past the left edge
+	if m.cursorX < m.colOffset {
+		m.colOffset = m.cursorX
+	}
+
+	// scroll right until cursor is visible
+	for m.colOffset < len(m.result.Columns) {
+		_, toCol := m.visibleColumnRange()
+		if m.cursorX < toCol {
+			break
+		}
+		m.colOffset++
+	}
+}
+
 func (m Model) visibleColumnRange() (int, int) {
 	if m.result == nil || len(m.result.Columns) == 0 {
 		return 0, 0
@@ -333,33 +565,149 @@ func (m Model) visibleColumnRange() (int, int) {
 	return start, end
 }
 
-func (m Model) renderFooter(fromCol, toCol, visibleRows int) string {
+// ── Footer / Overlays ───────────────────────────────────────────────────
+
+func (m Model) renderNormalFooter(fromCol, toCol, visibleRows int) string {
 	if m.result == nil {
 		return ""
 	}
 
-	rowStart := 0
-	rowEnd := 0
-	if m.result.RowCount > 0 {
-		rowStart = m.scrollY + 1
-		rowEnd = min(m.result.RowCount, m.scrollY+visibleRows)
+	colInfo := fmt.Sprintf("Col %d/%d", m.cursorX+1, len(m.result.Columns))
+	rowInfo := fmt.Sprintf("Row %d/%d", m.cursorY+1, m.result.RowCount)
+
+	if m.statusMessage != "" {
+		return theme.StyleSuccess.Render("  "+m.statusMessage) + "  " +
+			theme.StyleMuted.Render(colInfo+" | "+rowInfo)
 	}
 
-	colLeft := ""
-	colRight := ""
-	if fromCol > 0 {
-		colLeft = "← "
-	}
-	if toCol < len(m.result.Columns) {
-		colRight = " →"
-	}
-
-	colInfo := fmt.Sprintf("%sColumn %d-%d of %d%s", colLeft, fromCol+1, toCol, len(m.result.Columns), colRight)
-	rowInfo := fmt.Sprintf("Row %d-%d of %d (selected %d)", rowStart, rowEnd, m.result.RowCount, m.cursorY+1)
-	nav := "← → columns | ↑ ↓ rows | PgUp/PgDn pages"
-
-	return theme.StyleMuted.Render(colInfo + " | " + rowInfo + " | " + nav)
+	actions := "c:copy  y:row  e:export  f:filter  D:delete  Enter:detail"
+	return theme.StyleMuted.Render(colInfo + " | " + rowInfo + " | " + actions)
 }
+
+func (m Model) renderRecordDetail() string {
+	if m.result == nil || m.cursorY < 0 || m.cursorY >= len(m.result.Rows) {
+		return ""
+	}
+
+	row := m.result.Rows[m.cursorY]
+
+	recTitle := lipgloss.NewStyle().
+		Foreground(theme.ColorHighlight).
+		Bold(true).
+		Render(fmt.Sprintf("  Record %d of %d", m.cursorY+1, m.result.RowCount))
+
+	var b strings.Builder
+	b.WriteString(recTitle)
+	b.WriteString("\n")
+
+	// col widths for the two-column layout
+	nameWidth := 10
+	for _, col := range m.result.Columns {
+		w := lipgloss.Width(col)
+		if w > nameWidth {
+			nameWidth = w
+		}
+	}
+	if nameWidth > 25 {
+		nameWidth = 25
+	}
+
+	valueWidth := m.width - nameWidth - 7
+	if valueWidth < 20 {
+		valueWidth = 20
+	}
+
+	borderStyle := lipgloss.NewStyle().Foreground(theme.ColorBorder)
+	topBorder := borderStyle.Render(
+		"┌" + strings.Repeat("─", nameWidth+2) + "┬" + strings.Repeat("─", valueWidth+2) + "┐")
+	btmBorder := borderStyle.Render(
+		"└" + strings.Repeat("─", nameWidth+2) + "┴" + strings.Repeat("─", valueWidth+2) + "┘")
+
+	b.WriteString(topBorder)
+	b.WriteString("\n")
+
+	visible := m.height - 7
+	if visible < 1 {
+		visible = 1
+	}
+
+	scrollOff := 0
+	if m.menuCursor >= scrollOff+visible {
+		scrollOff = m.menuCursor - visible + 1
+	}
+	if m.menuCursor < scrollOff {
+		scrollOff = m.menuCursor
+	}
+
+	endIdx := min(len(m.result.Columns), scrollOff+visible)
+	for i := scrollOff; i < endIdx; i++ {
+		col := m.result.Columns[i]
+		val := ""
+		if i < len(row) {
+			val = row[i]
+		}
+
+		nameDisplay := fitCell(col, nameWidth)
+		valDisplay := fitCell(val, valueWidth)
+
+		nameContent := " " + nameDisplay + " "
+		valContent := " " + valDisplay + " "
+
+		if i == m.menuCursor {
+			nameContent = lipgloss.NewStyle().
+				Background(theme.ColorPrimary).
+				Foreground(lipgloss.Color("255")).
+				Bold(true).
+				Render(nameContent)
+			valContent = lipgloss.NewStyle().
+				Background(lipgloss.Color("236")).
+				Render(valContent)
+		}
+
+		b.WriteString("│" + nameContent + "│" + valContent + "│")
+		b.WriteString("\n")
+	}
+
+	b.WriteString(btmBorder)
+	b.WriteString("\n")
+
+	if m.statusMessage != "" {
+		b.WriteString(theme.StyleSuccess.Render("  " + m.statusMessage))
+		b.WriteString("  ")
+	}
+	b.WriteString(theme.StyleMuted.Render("c:copy | f:filter | ↑/↓ navigate | Esc close"))
+
+	return b.String()
+}
+
+func (m Model) renderCopyRowPrompt() string {
+	label := lipgloss.NewStyle().
+		Foreground(theme.ColorHighlight).
+		Bold(true).
+		Render("Copy row as: ")
+	opts := theme.StyleMuted.Render("[j]JSON  [c]CSV  [t]Text  [Esc]cancel")
+	return label + opts
+}
+
+func (m Model) renderExportPrompt() string {
+	label := lipgloss.NewStyle().
+		Foreground(theme.ColorHighlight).
+		Bold(true).
+		Render("Export results: ")
+	opts := theme.StyleMuted.Render("[j]JSON file  [c]CSV file  [Esc]cancel")
+	return label + opts
+}
+
+func (m Model) renderDeleteConfirm() string {
+	warning := lipgloss.NewStyle().
+		Foreground(theme.ColorError).
+		Bold(true).
+		Render("⚠ DELETE this record? ")
+	hint := theme.StyleMuted.Render("Sends to editor for review. [y]Yes [Esc]Cancel")
+	return warning + hint
+}
+
+// ── Cell helpers ────────────────────────────────────────────────────────
 
 func fitCell(v string, width int) string {
 	if width < 1 {
