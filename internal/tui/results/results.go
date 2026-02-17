@@ -2,7 +2,9 @@ package results
 
 import (
 	"fmt"
+	"slices"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -18,6 +20,8 @@ type Model struct {
 	height    int
 	focused   bool
 	scrollY   int
+	cursorY   int
+	colOffset int
 	loading   bool
 	colWidths []int
 }
@@ -53,6 +57,8 @@ func (m *Model) SetResult(r *database.QueryResult) {
 	m.result = r
 	m.err = nil
 	m.scrollY = 0
+	m.cursorY = 0
+	m.colOffset = 0
 	m.loading = false
 	m.calculateColumnWidths()
 }
@@ -62,6 +68,8 @@ func (m *Model) SetError(err error) {
 	m.err = err
 	m.result = nil
 	m.scrollY = 0
+	m.cursorY = 0
+	m.colOffset = 0
 	m.loading = false
 }
 
@@ -87,10 +95,10 @@ func (m *Model) calculateColumnWidths() {
 		}
 	}
 
-	// Enforce minimum of 1 and cap at 40
+	// Keep columns readable but bounded.
 	for i := range m.colWidths {
-		if m.colWidths[i] < 1 {
-			m.colWidths[i] = 1
+		if m.colWidths[i] < 8 {
+			m.colWidths[i] = 8
 		}
 		if m.colWidths[i] > 40 {
 			m.colWidths[i] = 40
@@ -113,28 +121,40 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "up", "k":
-			if m.scrollY > 0 {
-				m.scrollY--
+			if m.result != nil && m.cursorY > 0 {
+				m.cursorY--
+				m.ensureVerticalWindow()
 			}
 		case "down", "j":
-			if m.result != nil && m.scrollY < m.result.RowCount-1 {
-				m.scrollY++
+			if m.result != nil && m.cursorY < m.result.RowCount-1 {
+				m.cursorY++
+				m.ensureVerticalWindow()
 			}
 		case "pgup":
-			m.scrollY -= m.height / 2
-			if m.scrollY < 0 {
-				m.scrollY = 0
+			if m.result != nil {
+				step := max(1, m.visibleRows())
+				m.cursorY -= step
+				if m.cursorY < 0 {
+					m.cursorY = 0
+				}
+				m.ensureVerticalWindow()
 			}
 		case "pgdown":
 			if m.result != nil {
-				m.scrollY += m.height / 2
-				maxScroll := m.result.RowCount - 1
-				if m.scrollY > maxScroll {
-					m.scrollY = maxScroll
+				step := max(1, m.visibleRows())
+				m.cursorY += step
+				if m.cursorY > m.result.RowCount-1 {
+					m.cursorY = m.result.RowCount - 1
 				}
-				if m.scrollY < 0 {
-					m.scrollY = 0
-				}
+				m.ensureVerticalWindow()
+			}
+		case "left", "h":
+			if m.colOffset > 0 {
+				m.colOffset--
+			}
+		case "right", "l":
+			if m.result != nil && m.colOffset < len(m.result.Columns)-1 {
+				m.colOffset++
 			}
 		}
 	}
@@ -166,7 +186,7 @@ func (m Model) View() string {
 	// Header with stats
 	stats := fmt.Sprintf("%d row(s) | %s",
 		m.result.RowCount,
-		m.result.Duration.Round(1000).String(),
+		m.result.Duration.Round(time.Microsecond).String(),
 	)
 	header := titleStyle.Render("Results") + "  " +
 		theme.StyleMuted.Render(stats)
@@ -179,88 +199,202 @@ func (m Model) View() string {
 	b.WriteString(header)
 	b.WriteString("\n")
 
-	// Render table header
-	headerLine := m.renderRow(m.result.Columns, true)
-	b.WriteString(headerLine)
+	fromCol, toCol := m.visibleColumnRange()
+	tableCols := m.result.Columns[fromCol:toCol]
+	widths := slices.Clone(m.colWidths[fromCol:toCol])
+
+	b.WriteString(m.renderTopBorder(widths))
+	b.WriteString("\n")
+	b.WriteString(m.renderRow(tableCols, widths, true, false))
+	b.WriteString("\n")
+	b.WriteString(m.renderSeparator(widths))
 	b.WriteString("\n")
 
-	// Separator
-	sep := m.renderSeparator()
-	b.WriteString(sep)
-	b.WriteString("\n")
-
-	// Visible rows
-	visibleRows := m.height - 4
-	if visibleRows < 1 {
-		visibleRows = 1
-	}
-
-	for i := m.scrollY; i < len(m.result.Rows) && i < m.scrollY+visibleRows; i++ {
-		line := m.renderRow(m.result.Rows[i], false)
+	visibleRows := m.visibleRows()
+	rowEnd := min(len(m.result.Rows), m.scrollY+visibleRows)
+	for i := m.scrollY; i < rowEnd; i++ {
+		line := m.renderRow(m.result.Rows[i][fromCol:toCol], widths, false, i == m.cursorY)
 		b.WriteString(line)
-		if i < m.scrollY+visibleRows-1 && i < len(m.result.Rows)-1 {
-			b.WriteString("\n")
-		}
+		b.WriteString("\n")
 	}
+	b.WriteString(m.renderBottomBorder(widths))
+	b.WriteString("\n")
+	b.WriteString(m.renderFooter(fromCol, toCol, visibleRows))
 
 	return b.String()
 }
 
-func (m Model) renderRow(cells []string, isHeader bool) string {
+func (m Model) renderRow(cells []string, widths []int, isHeader bool, selected bool) string {
 	parts := make([]string, len(cells))
 	for i, cell := range cells {
-		width := 10
-		if i < len(m.colWidths) {
-			width = m.colWidths[i]
-		}
-		if width < 1 {
-			width = 1
-		}
-
-		display := cell
-		displayWidth := lipgloss.Width(display)
-
-		// Truncate if display is wider than column
-		if displayWidth > width {
-			runes := []rune(display)
-			if width > 1 && len(runes) > 0 {
-				// Trim runes until we fit (accounting for the ellipsis)
-				trimmed := runes
-				for lipgloss.Width(string(trimmed))>= width && len(trimmed) > 0 {
-					trimmed = trimmed[:len(trimmed)-1]
-				}
-				display = string(trimmed) + "…"
-			} else {
-				display = "…"
-			}
-			displayWidth = lipgloss.Width(display)
-		}
-
-		// Pad to column width; guard against negative (never panic)
-		pad := width - displayWidth
-		if pad > 0 {
-			display += strings.Repeat(" ", pad)
-		}
-
+		width := widths[i]
+		display := fitCell(cell, width)
 		if isHeader {
-			parts[i] = lipgloss.NewStyle().
+			display = lipgloss.NewStyle().
 				Bold(true).
 				Foreground(theme.ColorPrimary).
 				Render(display)
-		} else {
-			parts[i] = display
 		}
+		parts[i] = " " + display + " "
 	}
-	return "  " + strings.Join(parts, " │ ")
+	line := "│" + strings.Join(parts, "│") + "│"
+	if selected {
+		line = lipgloss.NewStyle().
+			Background(lipgloss.Color("236")).
+			Render(line)
+	}
+	return line
 }
 
-func (m Model) renderSeparator() string {
-	parts := make([]string, len(m.colWidths))
-	for i, w := range m.colWidths {
-		if w < 1 {
-			w = 1
-		}
-		parts[i] = strings.Repeat("─", w)
+func (m Model) renderTopBorder(widths []int) string {
+	return m.renderBorder("┌", "┬", "┐", widths)
+}
+
+func (m Model) renderBottomBorder(widths []int) string {
+	return m.renderBorder("└", "┴", "┘", widths)
+}
+
+func (m Model) renderSeparator(widths []int) string {
+	return m.renderBorder("├", "┼", "┤", widths)
+}
+
+func (m Model) renderBorder(left, center, right string, widths []int) string {
+	parts := make([]string, len(widths))
+	for i, w := range widths {
+		parts[i] = strings.Repeat("─", w+2)
 	}
-	return "  " + lipgloss.NewStyle().Foreground(theme.ColorBorder).Render(strings.Join(parts, "─┼─"))
+	line := left + strings.Join(parts, center) + right
+	return lipgloss.NewStyle().Foreground(theme.ColorBorder).Render(line)
+}
+
+func (m Model) visibleRows() int {
+	v := m.height - 8
+	if v < 1 {
+		v = 1
+	}
+	return v
+}
+
+func (m *Model) ensureVerticalWindow() {
+	if m.result == nil || m.result.RowCount == 0 {
+		m.scrollY = 0
+		m.cursorY = 0
+		return
+	}
+
+	if m.cursorY < 0 {
+		m.cursorY = 0
+	}
+	if m.cursorY >= m.result.RowCount {
+		m.cursorY = m.result.RowCount - 1
+	}
+
+	visible := m.visibleRows()
+	if m.cursorY < m.scrollY {
+		m.scrollY = m.cursorY
+	}
+	if m.cursorY >= m.scrollY+visible {
+		m.scrollY = m.cursorY - visible + 1
+	}
+
+	maxScroll := max(0, m.result.RowCount-visible)
+	if m.scrollY > maxScroll {
+		m.scrollY = maxScroll
+	}
+}
+
+func (m Model) visibleColumnRange() (int, int) {
+	if m.result == nil || len(m.result.Columns) == 0 {
+		return 0, 0
+	}
+
+	if m.colOffset >= len(m.result.Columns) {
+		return 0, len(m.result.Columns)
+	}
+
+	available := max(20, m.width-4)
+	start := max(0, m.colOffset)
+	end := start
+	total := 1
+
+	for i := start; i < len(m.colWidths); i++ {
+		colWidth := m.colWidths[i] + 3
+		if end > start && total+colWidth > available {
+			break
+		}
+		total += colWidth
+		end = i + 1
+	}
+
+	if end == start {
+		end = min(start+1, len(m.result.Columns))
+	}
+
+	return start, end
+}
+
+func (m Model) renderFooter(fromCol, toCol, visibleRows int) string {
+	if m.result == nil {
+		return ""
+	}
+
+	rowStart := 0
+	rowEnd := 0
+	if m.result.RowCount > 0 {
+		rowStart = m.scrollY + 1
+		rowEnd = min(m.result.RowCount, m.scrollY+visibleRows)
+	}
+
+	colLeft := ""
+	colRight := ""
+	if fromCol > 0 {
+		colLeft = "← "
+	}
+	if toCol < len(m.result.Columns) {
+		colRight = " →"
+	}
+
+	colInfo := fmt.Sprintf("%sColumn %d-%d of %d%s", colLeft, fromCol+1, toCol, len(m.result.Columns), colRight)
+	rowInfo := fmt.Sprintf("Row %d-%d of %d (selected %d)", rowStart, rowEnd, m.result.RowCount, m.cursorY+1)
+	nav := "← → columns | ↑ ↓ rows | PgUp/PgDn pages"
+
+	return theme.StyleMuted.Render(colInfo + " | " + rowInfo + " | " + nav)
+}
+
+func fitCell(v string, width int) string {
+	if width < 1 {
+		width = 1
+	}
+	v = strings.ReplaceAll(v, "\n", " ")
+	v = strings.ReplaceAll(v, "\r", " ")
+	v = strings.TrimSpace(v)
+	if v == "" {
+		v = "null"
+	}
+
+	if lipgloss.Width(v) > width {
+		v = truncateDisplay(v, width)
+	}
+
+	pad := width - lipgloss.Width(v)
+	if pad > 0 {
+		v += strings.Repeat(" ", pad)
+	}
+	return v
+}
+
+func truncateDisplay(s string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if width <= 3 {
+		return strings.Repeat(".", width)
+	}
+
+	target := width - 3
+	runes := []rune(s)
+	for len(runes) > 0 && lipgloss.Width(string(runes)) > target {
+		runes = runes[:len(runes)-1]
+	}
+	return string(runes) + "..."
 }
